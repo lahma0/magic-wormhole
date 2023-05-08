@@ -84,8 +84,6 @@ class Receiver:
             self._reactor,
             tor=self._tor,
             timing=self.args.timing)
-        if self.args.debug_state:
-            w.debug_set_trace("recv", which=" ".join(self.args.debug_state), file=self.args.stdout)
         self._w = w  # so tests can wait on events too
 
         # I wanted to do this instead:
@@ -175,6 +173,7 @@ class Receiver:
 
         while True:
             them_d = yield self._get_data(w)
+            # print("GOT", them_d)
             recognized = False
             if u"transit" in them_d:
                 recognized = True
@@ -215,21 +214,13 @@ class Receiver:
         if code:
             w.set_code(code)
         else:
-            if self.args.allocate:
-                w.allocate_code(self.args.code_length)
-                code = yield w.get_code()
-                print(u"Allocated code: {}".format(code), file=self.args.stderr)
-                print(u"On the other computer, please run:", file=self.args.stderr)
-                print(u"   wormhole send --code {} <filename>".format(code), file=self.args.stderr)
-
-            else:
-                prompt = "Enter receive wormhole code: "
-                used_completion = yield input_with_completion(
-                    prompt, w.input_code(), self._reactor)
-                if not used_completion:
-                    print(
-                        " (note: you can use <Tab> to complete words)",
-                        file=self.args.stderr)
+            prompt = "Enter receive wormhole code: "
+            used_completion = yield input_with_completion(
+                prompt, w.input_code(), self._reactor)
+            if not used_completion:
+                print(
+                    " (note: you can use <Tab> to complete words)",
+                    file=self.args.stderr)
         yield w.get_code()
 
     def _show_verifier(self, verifier_bytes):
@@ -292,6 +283,15 @@ class Receiver:
             rp = yield self._establish_transit()
             datahash = yield self._transfer_data(rp, f)
             self._write_directory(f)
+            if "basedirmode" in them_d["directory"]:
+                print(f"Setting permissions on destination directory '{os.path.basename(self.abs_destname)}' "
+                      f"to '{them_d['directory']['basedirmode'][-3:]}'.")
+                try:
+                    mode = int(them_d["directory"]["basedirmode"], 8)
+                    os.chmod(self.abs_destname, mode)
+                except Exception as ex:
+                    print(f"Error: Unable to set permissions on directory '{os.path.basename(self.abs_destname)}' "
+                          f"due to the following exception: '{ex}'")
             yield self._close_transit(rp, datahash)
         else:
             self._msg(u"I don't know what they're offering\n")
@@ -315,13 +315,9 @@ class Receiver:
                       (free, self.xfersize))
             raise TransferRejectedError()
 
-        # note the repr() here is (at least partially) to guard
-        # against malicious filenames that might play with how
-        # terminals display things. see also
-        # e.g. https://github.com/magic-wormhole/magic-wormhole/issues/476
         self._msg(u"Receiving file (%s) into: %s" %
                   (naturalsize(self.xfersize),
-                   repr(os.path.basename(self.abs_destname))))
+                   os.path.basename(self.abs_destname)))
         self._ask_permission()
         tmp_destname = self.abs_destname + ".tmp"
         return open(tmp_destname, "wb")
@@ -345,14 +341,11 @@ class Receiver:
 
         self._msg(u"Receiving directory (%s) into: %s/" %
                   (naturalsize(self.xfersize),
-                   repr(os.path.basename(self.abs_destname))))
+                   os.path.basename(self.abs_destname)))
         self._msg(u"%d files, %s (uncompressed)" %
                   (file_data["numfiles"], naturalsize(file_data["numbytes"])))
         self._ask_permission()
-        # max_size here matches the magic-number in cmd_send and will
-        # use up to 10MB of memory before putting the file on disk
-        # instead.
-        f = tempfile.SpooledTemporaryFile(max_size=10*1000*1000)
+        f = tempfile.SpooledTemporaryFile()
         # workaround for https://bugs.python.org/issue26175 (STF doesn't
         # fully implement IOBase abstract class), which breaks the new
         # zipfile in py3.7.0 that expects .seekable
@@ -372,12 +365,12 @@ class Receiver:
         # get confirmation from the user before writing to the local directory
         if os.path.exists(abs_destname):
             if self.args.output_file:  # overwrite is intentional
-                self._msg(u"Overwriting %s" % repr(destname))
+                self._msg(u"Overwriting '%s'" % destname)
                 if self.args.accept_file:
                     self._remove_existing(abs_destname)
             else:
                 self._msg(
-                    u"Error: refusing to overwrite existing %s" % repr(destname))
+                    u"Error: refusing to overwrite existing '%s'" % destname)
                 raise TransferRejectedError()
         return abs_destname
 
@@ -469,8 +462,8 @@ class Receiver:
                 for info in zf.infolist():
                     self._extract_file(zf, info, self.abs_destname)
 
-            self._msg(u"Received files written to %s/" % repr(os.path.basename(
-                self.abs_destname)))
+            self._msg(u"Received files written to %s/" % os.path.basename(
+                self.abs_destname))
             f.close()
 
     @inlineCallbacks

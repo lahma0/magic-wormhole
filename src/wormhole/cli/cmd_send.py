@@ -3,16 +3,20 @@ from __future__ import print_function
 import hashlib
 import os
 import sys
-
-import stat
 import tempfile
 import zipfile
+
+from pathlib import Path
+from stat import ST_MODE
+import random
+import string
+import subprocess
 
 import six
 from humanize import naturalsize
 from tqdm import tqdm
 from twisted.internet import reactor
-from twisted.internet.defer import inlineCallbacks, returnValue, Deferred
+from twisted.internet.defer import inlineCallbacks, returnValue
 from twisted.protocols import basic
 from twisted.python import log
 from wormhole import __version__, create
@@ -69,8 +73,6 @@ class Sender:
             self._reactor,
             tor=self._tor,
             timing=self._timing)
-        if self._args.debug_state:
-            w.debug_set_trace("send", which=" ".join(self._args.debug_state), file=self._args.stdout)
         d = self._go(w)
 
         # if we succeed, we should close and return the w.close results
@@ -162,20 +164,6 @@ class Sender:
                 notify.cancel()
 
         if args.verify:
-            # check_verifier() does a blocking call to input(), so stall for
-            # a moment to let any outbound messages get written into the
-            # kernel. At this point, we're sitting in a callback of
-            # get_verifier(), which is triggered by receipt of the other
-            # side's VERSION message. But we might have gotten both the PAKE
-            # and the VERSION message in the same turn, and our outbound
-            # VERSION message (triggered by receipt of their PAKE) is still
-            # in Twisted's transmit queue. If we don't wait a moment, it will
-            # be stuck there until `input()` returns, and the receiver won't
-            # be able to compute a Verifier for the users to compare. #349
-            # has more details
-            d = Deferred()
-            reactor.callLater(0.001, d.callback, None)
-            yield d
             self._check_verifier(w,
                                  verifier_bytes)  # blocks, can TransferError
 
@@ -197,14 +185,8 @@ class Sender:
             }
             self._send_data({u"transit": sender_transit}, w)
 
-            # When I made it possible to override APPID with a CLI argument
-            # (issue #113), I forgot to also change this w.derive_key()
-            # (issue #339). We're stuck with it now. Use a local constant to
-            # make this clear.
-            BUG339_APPID = u"lothar.com/wormhole/text-or-file-xfer"
-
             # TODO: move this down below w.get_message()
-            transit_key = w.derive_key(BUG339_APPID + "/transit-key",
+            transit_key = w.derive_key(APPID + "/transit-key",
                                        ts.TRANSIT_KEY_LENGTH)
             ts.set_transit_key(transit_key)
 
@@ -335,12 +317,9 @@ class Sender:
 
         if os.path.isdir(what):
             print(u"Building zipfile..", file=args.stderr)
-            # We're sending a directory. Create a zipfile and send that
-            # instead. SpooledTemporaryFile will use RAM until our size
-            # threshold (10MB) is reached, then moves everything into a
-            # tempdir (it tries $TMPDIR, $TEMP, $TMP, then platform-specific
-            # paths like /tmp).
-            fd_to_send = tempfile.SpooledTemporaryFile(max_size=10*1000*1000)
+            # We're sending a directory. Create a zipfile in a tempdir and
+            # send that.
+            fd_to_send = tempfile.SpooledTemporaryFile()
             # workaround for https://bugs.python.org/issue26175 (STF doesn't
             # fully implement IOBase abstract class), which breaks the new
             # zipfile in py3.7.0 that expects .seekable
@@ -360,6 +339,19 @@ class Sender:
                     # have "/subdir" appended. We want the zipfile to contain
                     # "" or "subdir"
                     localpath = list(path.split(os.sep)[tostrip:])
+                    for d in dirs:
+                        archivename = os.path.join(*tuple(localpath + [d]))
+                        localfilename = os.path.join(path, d)
+                        try:
+                            zf.write(localfilename, archivename)
+                        except OSError as e:
+                            errmsg = u"{}: {}".format(d, e.strerror)
+                            if self._args.ignore_unsendable_files:
+                                print(
+                                    u"{} (ignoring error)".format(errmsg),
+                                    file=args.stderr)
+                            else:
+                                raise UnsendableFileError(errmsg)
                     for fn in files:
                         archivename = os.path.join(*tuple(localpath + [fn]))
                         localfilename = os.path.join(path, fn)
@@ -384,27 +376,13 @@ class Sender:
                 "zipsize": filesize,
                 "numbytes": num_bytes,
                 "numfiles": num_files,
+                "basedirmode": oct(os.stat(what).st_mode & 0o777),
+                # "basedirmode": oct(os.stat(what)[ST_MODE])[-3:],
             }
             print(
                 u"Sending directory (%s compressed) named '%s'" %
                 (naturalsize(filesize), basename),
                 file=args.stderr)
-            return offer, fd_to_send
-
-        if stat.S_ISBLK(os.stat(what).st_mode):
-            fd_to_send = open(what, "rb")
-            filesize = fd_to_send.seek(0, 2)
-
-            offer["file"] = {
-                "filename": basename,
-                "filesize": filesize,
-            }
-            print(
-                u"Sending %s block device named '%s'" % (naturalsize(filesize),
-                                                         basename),
-                file=args.stderr)
-
-            fd_to_send.seek(0)
             return offer, fd_to_send
 
         raise TypeError("'%s' is neither file nor directory" % args.what)
